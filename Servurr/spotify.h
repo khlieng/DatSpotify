@@ -6,9 +6,12 @@
 sp_session * get_sp_session();
 uv_mutex_t * get_sp_mutex();
 char * get_sp_title();
-int grab_spotify_window();
-int grab_track_title();
-HWND get_sp_window();
+void load_image(vurr_res_t * res);
+void set_volume(float v);
+void pause();
+void next_track();
+void prev_track();
+char * ds_get_playlist(int index);
 void run_libspotify(void * arg);
 
 void SP_CALLCONV search_complete(sp_search * search, void * userdata);

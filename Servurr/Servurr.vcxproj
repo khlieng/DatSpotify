@@ -155,14 +155,16 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="fifo.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="spotify.c" />
-    <ClCompile Include="util.c" />
+    <ClCompile Include="stack.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="fifo.h" />
     <ClInclude Include="spotify.h" />
+    <ClInclude Include="stack.h" />
     <ClInclude Include="typedefs.h" />
-    <ClInclude Include="util.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
