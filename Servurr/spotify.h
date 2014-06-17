@@ -11,8 +11,10 @@ void set_volume(float v);
 void pause();
 void next_track();
 void prev_track();
+void play_url(const char * url);
 char * ds_get_playlist(int index);
 void run_libspotify(void * arg);
+void ds_cleanup();
 
 void SP_CALLCONV search_complete(sp_search * search, void * userdata);
 void SP_CALLCONV search_complete_play(sp_search * search, void * userdata);

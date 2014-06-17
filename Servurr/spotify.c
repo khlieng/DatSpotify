@@ -45,6 +45,7 @@ static PaStream * stream;
 static fifo_t * audio_fifo;
 static sp_playlist * playlist;
 static sp_track * playing;
+static int playing_duration;
 
 static uv_mutex_t * pa_mutex;
 static int track_ended = 0;
@@ -56,6 +57,9 @@ static int elapsed = 0;
 static int loading = FALSE;
 static int fadeout = FALSE;
 static int fadein = FALSE;
+static int prefetch = FALSE;
+
+static sp_track * upcoming_track;
 
 static fifo_t * pq;
 static stack_t * backstack;
@@ -74,15 +78,20 @@ static void SP_CALLCONV image_loaded(sp_image * image, void * userdata) {
 	size_t size;
 	const void * data = sp_image_data(image, &size);
 	vurr_res_t * res = (vurr_res_t *)userdata;
-	char * response = (char *)malloc(sizeof(char) * (strlen(headerJPEG) + size));
+	char * response = (char *)malloc(size);
 
-	memcpy(response, headerJPEG, strlen(headerJPEG));
-	memcpy(response + strlen(headerJPEG), data, size);
+	printf("image size: %d\n", size);
+
+	//memcpy(response, headerJPEG, strlen(headerJPEG));
+	memcpy(response, data, size);
 	
 	res->data = response;
-	res->len = strlen(headerJPEG) + size;
+	res->len = size;
 	
+	vurr_res_set(res, "Content-Type", "image/jpeg");
+	puts("calling vurr_write");
 	vurr_write(res);
+	puts("releasing image");
 	sp_image_release(image);
 }
 
@@ -93,7 +102,7 @@ static void SP_CALLCONV logged_out(sp_session * session) {
 static void SP_CALLCONV container_loaded(sp_playlistcontainer *pc, void *userdata)
 {
     playlist = sp_playlistcontainer_playlist(pc, 1);
-	puts("container loaded");
+	puts("playlist container loaded");
 	printf("%s\n", sp_playlist_name(playlist));
 }
 
@@ -112,12 +121,14 @@ static void SP_CALLCONV logged_in(sp_session * session, sp_error error) {
     else {
 		sp_playlistcontainer * playlists;
 
-        puts("Logged in");
+        puts("logged in");
 
 		playlists = sp_session_playlistcontainer(session);
 		sp_playlistcontainer_add_callbacks(playlists, &pc_callbacks, NULL);
 		if (sp_playlistcontainer_is_loaded(playlists)) {
 			playlist = sp_playlistcontainer_playlist(playlists, 1);
+			
+			upcoming_track = sp_playlist_track(playlist, rand() % sp_playlist_num_tracks(playlist));
 		}
     }
 }
@@ -125,14 +136,11 @@ static void SP_CALLCONV logged_in(sp_session * session, sp_error error) {
 static void load_track(sp_track * track) {
 	int duration;
 
-	uv_mutex_lock(pa_mutex);
-	loading = TRUE;
-	fadeout = TRUE;
-	elapsed = 0;
-	acc = 0;
-	uv_mutex_unlock(pa_mutex);
+	if (playing) {
+		sp_session_player_play(g_session, FALSE);
+		sp_session_player_unload(g_session);
+	}
 
-	uv_mutex_lock(sp_mutex);
 	duration = sp_track_duration(track) / 1000;
 
 	strcpy(titleBuffer, sp_artist_name(sp_track_artist(track, 0)));
@@ -140,12 +148,21 @@ static void load_track(sp_track * track) {
 	strcat(titleBuffer, sp_track_name(track));
 
 	playing = track;
+	playing_duration = duration;
+	prefetch = FALSE;
 
 	sp_session_player_load(g_session, track);
 	sp_session_player_play(g_session, TRUE);
-	uv_mutex_unlock(sp_mutex);
-	puts("load_track end");
-	//printf("%d:%d\n", (duration - (duration % 60)) / 60, duration % 60);
+
+	upcoming_track = sp_playlist_track(playlist, rand() % sp_playlist_num_tracks(playlist));
+
+	uv_mutex_lock(pa_mutex);
+	loading = TRUE;
+	fadeout = TRUE;
+	elapsed = 0;
+	acc = 0;
+	paused = FALSE;
+	uv_mutex_unlock(pa_mutex);
 }
 
 static int SP_CALLCONV music_delivery(sp_session * session, const sp_audioformat * format,
@@ -208,14 +225,14 @@ static void portaudio_drain(void * arg) {
 				}
 
 				if (fadeout && volume_mod > 0.0) {
-					volume_mod -= 0.1;
+					volume_mod -= 0.2;
 					if (volume_mod < 0.0) {
 						volume_mod = 0.0;
 					}
 				}
 
 				if (fadein && volume_mod < 1.0) {
-					volume_mod += 0.1;
+					volume_mod += 0.2;
 				}
 				else {
 					if (fadein) {
@@ -228,6 +245,14 @@ static void portaudio_drain(void * arg) {
 				if (acc >= 44100) {
 					acc -= 44100;
 					elapsed++;
+
+					uv_mutex_lock(sp_mutex);
+					if (!prefetch && playing && playing_duration - elapsed < 10) {
+						prefetch = TRUE;
+						puts("prefetching...");
+						sp_session_player_prefetch(g_session, upcoming_track);
+					}
+					uv_mutex_unlock(sp_mutex);
 				}
 
 				if (volume < 1.0 || volume_mod < 1.0) {
@@ -268,7 +293,6 @@ static void SP_CALLCONV notify_main_thread(sp_session * session) {
 	uv_mutex_lock(notify_mutex);
 
     notify_events = TRUE;
-	puts("notify main thread");
 	
 	uv_cond_broadcast(sp_cond);
 	uv_mutex_unlock(notify_mutex);
@@ -297,6 +321,7 @@ static void SP_CALLCONV search_complete_play(sp_search * search, void * userdata
 			sp_session_player_load(g_session, track);
 			sp_session_player_play(g_session, TRUE);
 			playing = track;
+			playing_duration = sp_track_duration(track) / 1000;
 		}
 	}
 	sp_search_release(search);
@@ -347,25 +372,39 @@ void pause() {
 }
 
 void next_track() {
-	sp_track * track;
-
 	if (!g_session) return;
 
-	uv_mutex_lock(sp_mutex);
-	track = sp_playlist_track(playlist, rand() % sp_playlist_num_tracks(playlist));
-	uv_mutex_unlock(sp_mutex);
-	
-	paused = FALSE;
 	stack_push(backstack, playing);
-	load_track(track);
+
+	uv_mutex_lock(sp_mutex);
+	load_track(upcoming_track);
+	uv_mutex_unlock(sp_mutex);
 }
 
 void prev_track() {
 	sp_track * track = (sp_track *)stack_pop(backstack);
 
 	if (track) {
+		uv_mutex_lock(sp_mutex);
+		load_track(track);
+		uv_mutex_unlock(sp_mutex);
+	}
+}
+
+void play_url(const char * url) {
+	sp_link * link;
+	sp_track * track;
+
+	uv_mutex_lock(sp_mutex);
+	link = sp_link_create_from_string(url);
+	track = sp_link_as_track(link);
+
+	if (track) {
 		load_track(track);
 	}
+
+	sp_link_release(link);
+	uv_mutex_unlock(sp_mutex);
 }
 
 void push_track(char * search) {
@@ -382,23 +421,40 @@ void play_track(char * search) {
 }
 
 char * ds_get_playlist(int index) {
-	sp_playlist * playlist = sp_playlistcontainer_playlist(sp_session_playlistcontainer(g_session), index);
+	char url[256];
+	sp_playlist * playlist;
+	
+	uv_mutex_lock(sp_mutex);
+	playlist = sp_playlistcontainer_playlist(sp_session_playlistcontainer(g_session), index);
+
 	if (playlist) {
 		json_t * json = json_object();
 		json_t * tracks = json_array();
 		char * json_s;
 		int i;
+
 		for (i = 0; i < sp_playlist_num_tracks(playlist); i++) {
+			sp_track * sptrack = sp_playlist_track(playlist, i);
+			sp_link * link = sp_link_create_from_track(sptrack, 0);
 			json_t * track = json_object();
-			json_object_set_new(track, "artist", json_string(sp_artist_name(sp_track_artist(sp_playlist_track(playlist, i), 0))));
-			json_object_set_new(track, "title", json_string(sp_track_name(sp_playlist_track(playlist, i))));
+
+			sp_link_as_string(link, url, sizeof(url));
+
+			json_object_set_new(track, "artist", json_string(sp_artist_name(sp_track_artist(sptrack, 0))));
+			json_object_set_new(track, "title", json_string(sp_track_name(sptrack)));			
+			json_object_set_new(track, "url", json_string(url));
 			json_array_append_new(tracks, track);
+
+			sp_link_release(link);
 		}
+		uv_mutex_unlock(sp_mutex),
+
 		json_object_set_new(json, "tracks", tracks);
 		json_s = json_dumps(json, JSON_COMPACT);
 		json_decref(json);
 		return json_s;
 	}
+	uv_mutex_unlock(sp_mutex);
 	return NULL;
 }
 
@@ -425,6 +481,8 @@ void run_libspotify(void * arg) {
 	uv_mutex_init(sp_mutex);
 	uv_mutex_init(pa_mutex);
 	uv_cond_init(sp_cond);
+
+	srand(time(NULL));
 	
     memset(&session_callbacks, 0, sizeof(session_callbacks));
     session_callbacks.logged_in = &logged_in;
@@ -457,11 +515,11 @@ void run_libspotify(void * arg) {
 	password[i] = '\0';
 	puts("");
 
-	puts("Creating session...");
+	puts("creating session...");
     error = sp_session_create(&config, &session);
 	
     if (error != SP_ERROR_OK) {
-        puts("Could not create session");
+        puts("could not create session");
     }
     else {
 		/*FILE * file_blob = fopen("blob", "r");
@@ -469,7 +527,7 @@ void run_libspotify(void * arg) {
 		sp_bitrate bitrate = SP_BITRATE_320k;
 		error = sp_session_preferred_bitrate(session, bitrate);
 		if (error != SP_ERROR_OK) {
-			puts("Failed setting bitrate");
+			puts("failed setting bitrate");
 		}
 		/*if (sp_session_relogin(session) == SP_ERROR_NO_CREDENTIALS) {
 			puts("No relogin creds");
@@ -482,7 +540,7 @@ void run_libspotify(void * arg) {
 		}
 
 		if (!file_blob) {*/
-        puts("Logging in...");
+        puts("logging in...");
 		sp_session_login(session, username, password, FALSE, NULL);
 		/*}
 		else {
@@ -508,7 +566,6 @@ void run_libspotify(void * arg) {
 	Pa_StartStream(stream);
 
 	push_track("tristam i remember");
-	srand(time(NULL));
 
 	uv_mutex_lock(notify_mutex);
     while (1) {
@@ -518,6 +575,8 @@ void run_libspotify(void * arg) {
 
         notify_events = FALSE;
 		uv_mutex_unlock(notify_mutex);
+
+		puts("spotify main thread says hi");
 
 		if (track_ended) {
 			track_ended = FALSE;
@@ -532,4 +591,23 @@ void run_libspotify(void * arg) {
 
         uv_mutex_lock(notify_mutex);
     }
+}
+
+void ds_cleanup() {
+	puts("pa cleanup");
+	if (stream) {
+		uv_mutex_lock(pa_mutex);
+		Pa_StopStream(stream);
+		Pa_CloseStream(stream);
+		uv_mutex_unlock(pa_mutex);
+	}
+	puts("sp cleanup");
+	if (g_session) {
+		uv_mutex_lock(sp_mutex);
+		if (sp_session_user(g_session)) {
+			sp_session_logout(g_session);
+		}
+		sp_session_release(g_session);
+		uv_mutex_unlock(sp_mutex);
+	}
 }
